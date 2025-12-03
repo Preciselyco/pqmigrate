@@ -62,30 +62,31 @@ func New(config Config) *PQMigrate {
 // MigrateUp applies `up` migrations from migration dir in order.
 // `steps` are number of migrations to perform. If steps == -1
 // all `up` migrations will be applied.
-func (ctx *PQMigrate) MigrateUp(steps int) error {
+func (ctx *PQMigrate) MigrateUp(steps int) (int, error) {
 	ctx.dbg("MigrateUp", steps)
 	migrations, err := ctx.migrationGetAll()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := ctx.dbMigrationsTableExist(); err != nil {
 		ctx.dbg("MigrateUp", err)
-		return err
+		return 0, err
 	}
 	migrated, err := ctx.dbGetMigrated()
 	if err != nil {
 		ctx.dbg("MigrateUp", err)
-		return err
+		return 0, err
 	}
 	ss := ctx.migrationSuperSet(migrations, migrated)
 	if len(ss) == 0 {
 		ctx.logger.Inf("there was nothing to migrate")
-		return nil
+		return 0, nil
 	}
 	stepsLeft := steps
 	if steps == -1 {
 		stepsLeft = len(ss)
 	}
+	var done int
 	for _, m := range ss {
 		ctx.dbg("stepsLeft", stepsLeft)
 		if stepsLeft < 1 {
@@ -93,11 +94,12 @@ func (ctx *PQMigrate) MigrateUp(steps int) error {
 		}
 		if err := ctx.dbMigrate(m, migrateUp); err != nil {
 			ctx.dbg("MigrateUp", err)
-			return err
+			return 0, err
 		}
+		done++
 		stepsLeft--
 	}
-	return nil
+	return done, nil
 }
 
 // MigrateUpFile applies specified `up` migration and inserts
@@ -121,24 +123,25 @@ func (ctx *PQMigrate) MigrateUpFile(fileName string) error {
 // MigrateDown applies `down` migrations from migration dir in order.
 // `steps` are number of migrations to perform. If steps == -1
 // all `down` migrations will be applied.
-func (ctx *PQMigrate) MigrateDown(steps int) error {
+func (ctx *PQMigrate) MigrateDown(steps int) (int, error) {
 	ctx.dbg("MigrateDown", steps)
 	if err := ctx.dbMigrationsTableExist(); err != nil {
-		return err
+		return 0, err
 	}
 	migratedVersions, err := ctx.dbGetMigrated()
 	if err != nil {
 		ctx.dbg("MigrateDown", err)
-		return err
+		return 0, err
 	}
 	if len(migratedVersions) == 0 {
 		ctx.logger.Inf("there was nothing to migrate")
-		return nil
+		return 0, nil
 	}
 	stepsLeft := steps
 	if stepsLeft == -1 {
 		stepsLeft = len(migratedVersions)
 	}
+	var done int
 	for _, m := range migratedVersions {
 		ctx.dbg("stepsLeft", stepsLeft)
 		if stepsLeft < 1 {
@@ -146,11 +149,12 @@ func (ctx *PQMigrate) MigrateDown(steps int) error {
 		}
 		if err := ctx.dbMigrate(m, migrateDown); err != nil {
 			ctx.dbg("MigrateDown", err)
-			return err
+			return 0, err
 		}
+		done++
 		stepsLeft--
 	}
-	return nil
+	return done, nil
 }
 
 // MigrateDownFile applies specified `down` migration and deletes
@@ -465,7 +469,7 @@ func (ctx *PQMigrate) DumpDBFullWithPath(fname *string) (string, error) {
 		return "", err
 	}
 	fp := filepath.Join(ctx.config.BaseDirectory, getFileNameOrDefault("dump", "sql", fname, nil))
-	file, err := os.OpenFile(fp, os.O_RDWR|os.O_CREATE, 0644)
+	file, err := os.OpenFile(fp, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		ctx.dbg("dumpDBData", err)
 		return "", err
@@ -489,7 +493,6 @@ func (ctx *PQMigrate) DumpDBFullWithPath(fname *string) (string, error) {
 	}
 	ctx.logger.Ok(fmt.Sprintf("database dump written to \"%s\"", fp))
 	return fp, nil
-
 }
 
 // LoadFullDump loads database schema and data from specified file
