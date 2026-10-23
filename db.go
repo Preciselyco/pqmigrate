@@ -1,7 +1,9 @@
 package pqmigrate
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	"github.com/Preciselyco/pqdbr"
 	_ "github.com/lib/pq"
@@ -195,8 +197,12 @@ func (ctx *PQMigrate) dbMigrate(mig *migration, md migrateDirection) error {
 }
 
 func (ctx *PQMigrate) dbInsertMigration(mig *migration) error {
+	return ctx.dbInsertMigrationTx(ctx.tx, mig)
+}
+
+func (ctx *PQMigrate) dbInsertMigrationTx(tx *pqdbr.Tx, mig *migration) error {
 	ctx.dbgJoin("dbInsertMigration", "inserting:", mig.Name)
-	_, err := ctx.tx.InsertInto(ctx.config.MigrationsTable).
+	_, err := tx.InsertInto(ctx.config.MigrationsTable).
 		Columns("version", "name", "up", "down").
 		Values(mig.Version, mig.Name, mig.Up, mig.Down).
 		Exec()
@@ -218,8 +224,12 @@ func (ctx *PQMigrate) dbInsertMigrationBatch(migs []*migration) error {
 }
 
 func (ctx *PQMigrate) dbDeleteMigration(mig *migration) error {
+	return ctx.dbDeleteMigrationTx(ctx.tx, mig)
+}
+
+func (ctx *PQMigrate) dbDeleteMigrationTx(tx *pqdbr.Tx, mig *migration) error {
 	ctx.dbgJoin("dbDeleteMigration", "deleting:", mig.Name)
-	_, err := ctx.tx.DeleteFrom(ctx.config.MigrationsTable).
+	_, err := tx.DeleteFrom(ctx.config.MigrationsTable).
 		Where(pqdbr.Eq("version", mig.Version)).
 		Exec()
 	return err
@@ -310,4 +320,180 @@ func (ctx *PQMigrate) dbFinish() error {
 		ctx.dbg("dbFinish", "ok")
 	}
 	return nil
+}
+
+// dbMigrateAny runs mig in direction md, outside a transaction when the
+// migration is marked with the no-transaction directive.
+func (ctx *PQMigrate) dbMigrateAny(mig *migration, md migrateDirection) error {
+	if mig.noTx(md) {
+		return ctx.dbMigrateNoTx(mig, md)
+	}
+	return ctx.dbMigrate(mig, md)
+}
+
+// dbMigrateNoTx runs a no-transaction migration. Any open transaction is
+// committed first: a statement such as CREATE INDEX CONCURRENTLY waits for
+// every transaction older than itself, including ours. The migration text is
+// executed as-is on a connection of its own, and only when it succeeds is the
+// migrations table updated, in a short transaction committed immediately.
+func (ctx *PQMigrate) dbMigrateNoTx(mig *migration, md migrateDirection) error {
+	ctx.logger.Inf(fmt.Sprintf("migrating > %s (%s, no-transaction)", mig.Name, string(md)))
+	if err := ctx.dbCommitOpenTx(); err != nil {
+		return err
+	}
+	aux, err := ctx.dbGetAux()
+	if err != nil {
+		return err
+	}
+	contents := mig.Up
+	if md == migrateDown {
+		contents = mig.Down
+	}
+	bg := context.Background()
+	conn, err := aux.Conn(bg)
+	if err != nil {
+		ctx.dbg("dbMigrateNoTx", err)
+		return err
+	}
+	_, err = conn.ExecContext(bg, contents)
+	conn.Close()
+	if err != nil {
+		ctx.dbg("dbMigrateNoTx", err)
+		return fmt.Errorf("%s: %w", mig.fileName(md), err)
+	}
+	tx, err := aux.NewSession(nil).Begin()
+	if err != nil {
+		ctx.dbg("dbMigrateNoTx", err)
+		return fmt.Errorf("%s was applied but not recorded in %s: %w", mig.fileName(md), ctx.config.MigrationsTable, err)
+	}
+	defer tx.RollbackUnlessCommitted()
+	if md == migrateUp {
+		err = ctx.dbInsertMigrationTx(tx, mig)
+	} else {
+		err = ctx.dbDeleteMigrationTx(tx, mig)
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		ctx.dbg("dbMigrateNoTx", err)
+		return fmt.Errorf("%s was applied but not recorded in %s: %w", mig.fileName(md), ctx.config.MigrationsTable, err)
+	}
+	return nil
+}
+
+// dbCommitOpenTx commits ctx.tx, if one is open, through the regular commit
+// path (dbFinish), which also closes the main connection pool; it is reopened
+// on demand.
+func (ctx *PQMigrate) dbCommitOpenTx() error {
+	if ctx.tx == nil {
+		return nil
+	}
+	ctx.dbg("dbCommitOpenTx", "committing open transaction")
+	return ctx.dbFinish()
+}
+
+// dbGetAux returns a connection pool separate from the one ctx.tx runs on.
+// dbFinish closes the main pool after every commit, so the advisory lock
+// session and no-transaction migrations live in this one instead; it is closed
+// by dbReleaseAux.
+func (ctx *PQMigrate) dbGetAux() (*pqdbr.Connection, error) {
+	if ctx.auxConn != nil {
+		return ctx.auxConn, nil
+	}
+	ctx.dbg("dbGetAux", "opening auxiliary connection pool")
+	aux, err := ctx.dbConnectWithURL(ctx.config.DBUrl)
+	if err != nil {
+		ctx.dbg("dbGetAux", err)
+		return nil, err
+	}
+	ctx.auxConn = aux
+	return aux, nil
+}
+
+// lockPollInterval is how often a waiting migrator retries the advisory lock.
+var lockPollInterval = 250 * time.Millisecond
+
+// lockLogInterval is how often a waiting migrator repeats its log line.
+const lockLogInterval = 30 * time.Second
+
+// dbLock takes the session-level advisory lock Config.LockKey, unless it is 0
+// or already held by ctx. It polls pg_try_advisory_lock instead of blocking in
+// pg_advisory_lock: a session blocked in a statement holds a snapshot, and
+// CREATE INDEX CONCURRENTLY in the lock holder waits for every older snapshot,
+// so a blocked waiter would deadlock against it (undetected, since the lock
+// and the index build are on different backends).
+func (ctx *PQMigrate) dbLock() error {
+	if ctx.config.LockKey == 0 || ctx.lockConn != nil {
+		return nil
+	}
+	ctx.dbg("dbLock", ctx.config.LockKey)
+	aux, err := ctx.dbGetAux()
+	if err != nil {
+		return err
+	}
+	bg := context.Background()
+	conn, err := aux.Conn(bg)
+	if err != nil {
+		ctx.dbg("dbLock", err)
+		_ = ctx.dbReleaseAux()
+		return err
+	}
+	var lastLogged time.Time
+	for {
+		var locked bool
+		if err := conn.QueryRowContext(bg, "select pg_try_advisory_lock($1)", ctx.config.LockKey).Scan(&locked); err != nil {
+			ctx.dbg("dbLock", err)
+			conn.Close()
+			_ = ctx.dbReleaseAux()
+			return err
+		}
+		if locked {
+			break
+		}
+		if lastLogged.IsZero() || time.Since(lastLogged) >= lockLogInterval {
+			ctx.logger.Inf(fmt.Sprintf("waiting for migration lock %d", ctx.config.LockKey))
+			lastLogged = time.Now()
+		}
+		time.Sleep(lockPollInterval)
+	}
+	ctx.dbg("dbLock", "acquired")
+	ctx.lockConn = conn
+	return nil
+}
+
+// dbUnlockIfDone releases the advisory lock at the end of a migrate call,
+// unless a transaction is still open: then the lock is held until Finish
+// commits it, so another migrator sees the recorded rows.
+func (ctx *PQMigrate) dbUnlockIfDone() {
+	if ctx.tx != nil {
+		ctx.dbg("dbUnlockIfDone", "transaction open, holding lock until Finish")
+		return
+	}
+	if err := ctx.dbReleaseAux(); err != nil {
+		ctx.logger.Warn(fmt.Sprintf("releasing migration lock: %v", err))
+	}
+}
+
+// dbReleaseAux releases the advisory lock, if held, and closes the auxiliary
+// pool. Closing the pool ends the lock session, so the lock is gone even if
+// the unlock statement fails.
+func (ctx *PQMigrate) dbReleaseAux() error {
+	var firstErr error
+	if ctx.lockConn != nil {
+		ctx.dbg("dbReleaseAux", "releasing lock")
+		if _, err := ctx.lockConn.ExecContext(context.Background(), "select pg_advisory_unlock($1)", ctx.config.LockKey); err != nil {
+			firstErr = err
+		}
+		ctx.lockConn.Close()
+		ctx.lockConn = nil
+	}
+	if ctx.auxConn != nil {
+		ctx.dbg("dbReleaseAux", "closing auxiliary connection pool")
+		if err := ctx.auxConn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		ctx.auxConn = nil
+	}
+	return firstErr
 }

@@ -18,6 +18,67 @@ type migration struct {
 	Down    string `db:"down"`
 }
 
+// noTxDirective marks a migration file that must run outside a transaction
+// when it is the file's first line.
+const noTxDirective = "-- pqmigrate:no-transaction"
+
+// hasNoTxDirective reports whether contents starts with the no-transaction
+// directive line. Trailing whitespace on that line is allowed.
+func hasNoTxDirective(contents string) bool {
+	firstLine := contents
+	if i := strings.IndexByte(contents, '\n'); i >= 0 {
+		firstLine = contents[:i]
+	}
+	return strings.TrimRight(firstLine, " \t\r") == noTxDirective
+}
+
+// noTx reports whether the migration runs outside a transaction in the given
+// direction. It is derived from the migration text, so it works the same for
+// migrations loaded from disk, from a squash file and from the migrations
+// table (which stores the text including the directive).
+func (m *migration) noTx(md migrateDirection) bool {
+	if md == migrateDown {
+		return hasNoTxDirective(m.Down)
+	}
+	return hasNoTxDirective(m.Up)
+}
+
+func (m *migration) fileName(md migrateDirection) string {
+	return m.Name + "." + string(md) + ".sql"
+}
+
+// migrationSplitNoTx splits migs, keeping their order, into the ones that run
+// in a transaction and the ones that run outside one in direction md.
+func migrationSplitNoTx(migs []*migration, md migrateDirection) (tx, noTx []*migration) {
+	for _, m := range migs {
+		if m.noTx(md) {
+			noTx = append(noTx, m)
+		} else {
+			tx = append(tx, m)
+		}
+	}
+	return tx, noTx
+}
+
+// migrationCheckNoTx returns an error naming the first migration in migs that
+// would run outside a transaction in direction md when that is not allowed:
+// Config.AllowNoTransaction is off, or Config.DryRun is on (a statement run
+// outside a transaction cannot be rolled back).
+func (ctx *PQMigrate) migrationCheckNoTx(migs []*migration, md migrateDirection) error {
+	for _, m := range migs {
+		if !m.noTx(md) {
+			continue
+		}
+		if !ctx.config.AllowNoTransaction {
+			return fmt.Errorf("migration %s is marked %q but Config.AllowNoTransaction is false", m.fileName(md), noTxDirective)
+		}
+		if ctx.config.DryRun {
+			return fmt.Errorf("migration %s is marked %q and cannot be dry-run", m.fileName(md), noTxDirective)
+		}
+	}
+	return nil
+}
+
 var (
 	reMigrationName   = regexp.MustCompilePOSIX(`^[a-z0-9][a-z0-9_]+$`)
 	migrationFileRegx = regexp.MustCompilePOSIX(`^[0-9]{10}[^.]+\.(up|down).sql$`)
@@ -229,20 +290,24 @@ func (ctx *PQMigrate) migrationSuperSet(vs1, vs2 []*migration) (r1 []*migration)
 	return
 }
 
-func (ctx *PQMigrate) migrationCreate(name string) error {
-	ctx.dbg("migrationCreate", name)
+func (ctx *PQMigrate) migrationCreate(name string, noTx bool) error {
+	ctx.dbg("migrationCreate", name, noTx)
 	if ok := reMigrationName.MatchString(name); !ok {
 		return fmt.Errorf("invalid migration name, must match the regexp: ^[a-z0-9_]+$")
 	}
 	epoch := strconv.FormatInt(time.Now().Unix(), 10)
 	down := epoch + "_" + name + ".down.sql"
 	up := epoch + "_" + name + ".up.sql"
+	contents := []byte("")
+	if noTx {
+		contents = []byte(noTxDirective + "\n")
+	}
 	ctx.logger.Print(fmt.Sprintf("creating %s", down))
-	if err := ctx.fileWriteContents(down, []byte("")); err != nil {
+	if err := ctx.fileWriteContents(down, contents); err != nil {
 		return err
 	}
 	ctx.logger.Print(fmt.Sprintf("creating %s", up))
-	return ctx.fileWriteContents(up, []byte(""))
+	return ctx.fileWriteContents(up, contents)
 }
 
 type migrationSet struct {
