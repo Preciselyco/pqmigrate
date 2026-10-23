@@ -20,7 +20,14 @@ import (
 // CreateMigration creates a new migration file with specified name
 func (ctx *PQMigrate) CreateMigration(name string) error {
 	ctx.dbg("CreateMigration", name)
-	return ctx.migrationCreate(name)
+	return ctx.migrationCreate(name, false)
+}
+
+// CreateMigrationNoTx creates a new migration file pair with specified name,
+// both starting with the `-- pqmigrate:no-transaction` directive.
+func (ctx *PQMigrate) CreateMigrationNoTx(name string) error {
+	ctx.dbg("CreateMigrationNoTx", name)
+	return ctx.migrationCreate(name, true)
 }
 
 // Finish commits lingering database transaction (if all in one transaction specified)
@@ -62,8 +69,16 @@ func New(config Config) *PQMigrate {
 // MigrateUp applies `up` migrations from migration dir in order.
 // `steps` are number of migrations to perform. If steps == -1
 // all `up` migrations will be applied.
+//
+// No-transaction migrations among them are deferred: the transactional ones
+// run first and are committed, then the no-transaction ones run, each in
+// version order.
 func (ctx *PQMigrate) MigrateUp(steps int) (int, error) {
 	ctx.dbg("MigrateUp", steps)
+	if err := ctx.dbLock(); err != nil {
+		return 0, err
+	}
+	defer ctx.dbUnlockIfDone()
 	migrations, err := ctx.migrationGetAll()
 	if err != nil {
 		return 0, err
@@ -82,22 +97,47 @@ func (ctx *PQMigrate) MigrateUp(steps int) (int, error) {
 		ctx.logger.Inf("there was nothing to migrate")
 		return 0, nil
 	}
-	stepsLeft := steps
-	if steps == -1 {
-		stepsLeft = len(ss)
+	return ctx.migrateSteps(ss, steps, migrateUp)
+}
+
+// migrateSteps runs the first `steps` (all if -1) of migs in direction md:
+// for `up` the transactional ones first and the no-transaction ones after
+// them, for `down` the other way around, keeping the order of migs within
+// each group.
+func (ctx *PQMigrate) migrateSteps(migs []*migration, steps int, md migrateDirection) (int, error) {
+	if steps != -1 && steps < len(migs) {
+		if steps < 0 {
+			steps = 0
+		}
+		migs = migs[:steps]
+	}
+	ctx.dbg("migrateSteps", len(migs))
+	if err := ctx.migrationCheckNoTx(migs, md); err != nil {
+		return 0, err
+	}
+	txMigs, noTxMigs := migrationSplitNoTx(migs, md)
+	ordered := make([]*migration, 0, len(migs))
+	if md == migrateDown {
+		ordered = append(append(ordered, noTxMigs...), txMigs...)
+	} else {
+		ordered = append(append(ordered, txMigs...), noTxMigs...)
 	}
 	var done int
-	for _, m := range ss {
-		ctx.dbg("stepsLeft", stepsLeft)
-		if stepsLeft < 1 {
-			break
+	for i, m := range ordered {
+		if md == migrateUp && i == len(txMigs) && i > 0 {
+			// first no-transaction migration, after committed transactional ones
+			if err := ctx.dbCommitOpenTx(); err != nil {
+				return 0, err
+			}
+			if ctx.config.AfterTxCommit != nil {
+				ctx.config.AfterTxCommit()
+			}
 		}
-		if err := ctx.dbMigrate(m, migrateUp); err != nil {
-			ctx.dbg("MigrateUp", err)
+		if err := ctx.dbMigrateAny(m, md); err != nil {
+			ctx.dbg("migrateSteps", err)
 			return 0, err
 		}
 		done++
-		stepsLeft--
 	}
 	return done, nil
 }
@@ -106,14 +146,21 @@ func (ctx *PQMigrate) MigrateUp(steps int) (int, error) {
 // both `up` and `down` into the migrations table.
 func (ctx *PQMigrate) MigrateUpFile(fileName string) error {
 	ctx.dbg("MigrateUpFile", fileName)
-	if err := ctx.dbMigrationsTableExist(); err != nil {
+	if err := ctx.dbLock(); err != nil {
 		return err
 	}
-	migration, err := ctx.migrationGetSpecific(fileName)
+	defer ctx.dbUnlockIfDone()
+	mig, err := ctx.migrationGetSpecific(fileName)
 	if err != nil {
 		return err
 	}
-	if err := ctx.dbMigrate(migration, migrateUp); err != nil {
+	if err := ctx.migrationCheckNoTx([]*migration{mig}, migrateUp); err != nil {
+		return err
+	}
+	if err := ctx.dbMigrationsTableExist(); err != nil {
+		return err
+	}
+	if err := ctx.dbMigrateAny(mig, migrateUp); err != nil {
 		ctx.dbg("MigrateUpFile", err)
 		return err
 	}
@@ -123,8 +170,15 @@ func (ctx *PQMigrate) MigrateUpFile(fileName string) error {
 // MigrateDown applies `down` migrations from migration dir in order.
 // `steps` are number of migrations to perform. If steps == -1
 // all `down` migrations will be applied.
+//
+// No-transaction `down` migrations among them run first, then the
+// transactional ones, each in descending version order.
 func (ctx *PQMigrate) MigrateDown(steps int) (int, error) {
 	ctx.dbg("MigrateDown", steps)
+	if err := ctx.dbLock(); err != nil {
+		return 0, err
+	}
+	defer ctx.dbUnlockIfDone()
 	if err := ctx.dbMigrationsTableExist(); err != nil {
 		return 0, err
 	}
@@ -137,38 +191,28 @@ func (ctx *PQMigrate) MigrateDown(steps int) (int, error) {
 		ctx.logger.Inf("there was nothing to migrate")
 		return 0, nil
 	}
-	stepsLeft := steps
-	if stepsLeft == -1 {
-		stepsLeft = len(migratedVersions)
-	}
-	var done int
-	for _, m := range migratedVersions {
-		ctx.dbg("stepsLeft", stepsLeft)
-		if stepsLeft < 1 {
-			break
-		}
-		if err := ctx.dbMigrate(m, migrateDown); err != nil {
-			ctx.dbg("MigrateDown", err)
-			return 0, err
-		}
-		done++
-		stepsLeft--
-	}
-	return done, nil
+	return ctx.migrateSteps(migratedVersions, steps, migrateDown)
 }
 
 // MigrateDownFile applies specified `down` migration and deletes
 // both `up` and `down` from migrations table.
 func (ctx *PQMigrate) MigrateDownFile(fileName string) error {
 	ctx.dbg("MigrateDownFile", fileName)
-	if err := ctx.dbMigrationsTableExist(); err != nil {
+	if err := ctx.dbLock(); err != nil {
 		return err
 	}
-	migration, err := ctx.migrationGetSpecific(fileName)
+	defer ctx.dbUnlockIfDone()
+	mig, err := ctx.migrationGetSpecific(fileName)
 	if err != nil {
 		return err
 	}
-	if err := ctx.dbMigrate(migration, migrateDown); err != nil {
+	if err := ctx.migrationCheckNoTx([]*migration{mig}, migrateDown); err != nil {
+		return err
+	}
+	if err := ctx.dbMigrationsTableExist(); err != nil {
+		return err
+	}
+	if err := ctx.dbMigrateAny(mig, migrateDown); err != nil {
 		ctx.dbg("MigrateDownFile", err)
 		return err
 	}
@@ -205,6 +249,10 @@ func (ctx *PQMigrate) Sync(cb ConfirmCB) error {
 	if cb == nil {
 		return fmt.Errorf("Sync is only usable interactively")
 	}
+	if err := ctx.dbLock(); err != nil {
+		return err
+	}
+	defer ctx.dbUnlockIfDone()
 	if err := ctx.dbMigrationsTableExist(); err != nil {
 		ctx.dbg("Sync", err)
 		return err
@@ -246,6 +294,25 @@ func (ctx *PQMigrate) Sync(cb ConfirmCB) error {
 			changedMigrations = append(changedMigrations, fm)
 		}
 	}
+	migratedOnlyInDb := migrationSliceDifference(migrated, migrations)
+	newMigrations := migrationSliceDifference(migrations, migrated)
+	changedInDb := make([]*migration, 0, len(changedMigrations))
+	for _, m := range changedMigrations {
+		changedInDb = append(changedInDb, migratedMap[m.Version])
+	}
+	for _, check := range []struct {
+		migs []*migration
+		md   migrateDirection
+	}{
+		{changedInDb, migrateDown},
+		{changedMigrations, migrateUp},
+		{migratedOnlyInDb, migrateDown},
+		{newMigrations, migrateUp},
+	} {
+		if err := ctx.migrationCheckNoTx(check.migs, check.md); err != nil {
+			return err
+		}
+	}
 	if len(changedMigrations) > 0 {
 		// we have migrations that have changed on disk
 		ctx.logger.Warn(fmt.Sprintf("%d migration(s) changed on disk!", len(changedMigrations)))
@@ -264,17 +331,16 @@ func (ctx *PQMigrate) Sync(cb ConfirmCB) error {
 				ctx.logger.Warn("skipping migration...")
 				continue
 			}
-			if err := ctx.dbMigrate(dbMigration, migrateDown); err != nil {
+			if err := ctx.dbMigrateAny(dbMigration, migrateDown); err != nil {
 				ctx.logger.Error(err)
 				return err
 			}
-			if err := ctx.dbMigrate(migration, migrateUp); err != nil {
+			if err := ctx.dbMigrateAny(migration, migrateUp); err != nil {
 				ctx.logger.Error(err)
 				return err
 			}
 		}
 	}
-	migratedOnlyInDb := migrationSliceDifference(migrated, migrations)
 	if len(migratedOnlyInDb) > 0 {
 		// we have migrations that don't exist in file system
 		ctx.logger.Warn(fmt.Sprintf("%d migrations don't exist on disk", len(migratedOnlyInDb)))
@@ -288,19 +354,16 @@ func (ctx *PQMigrate) Sync(cb ConfirmCB) error {
 				ctx.logger.Warn("skipping migration...")
 				continue
 			}
-			if err := ctx.dbMigrate(migration, migrateDown); err != nil {
+			if err := ctx.dbMigrateAny(migration, migrateDown); err != nil {
 				return err
 			}
 		}
 	}
-	newMigrations := migrationSliceDifference(migrations, migrated)
 	if len(newMigrations) > 0 {
 		ctx.logger.Inf(fmt.Sprintf("applying %d new migration(s)", len(newMigrations)))
 		sort.Sort(byVersion(newMigrations))
-		for _, migration := range newMigrations {
-			if err := ctx.dbMigrate(migration, migrateUp); err != nil {
-				return err
-			}
+		if _, err := ctx.migrateSteps(newMigrations, -1, migrateUp); err != nil {
+			return err
 		}
 	} else {
 		ctx.logger.Inf("nothing to migrate")

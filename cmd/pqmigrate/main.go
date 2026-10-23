@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	version = "v1.4.1"
+	version = "v1.5.0"
 )
 
 var arguments = map[string]interface{}{}
@@ -29,6 +29,7 @@ const (
 	argSteps      = "--steps"
 	argBW         = "--bw"
 	argDryRun     = "-d"
+	argNoTx       = "--no-tx"
 	argHelpConfig = "--help-config"
 	argVersion    = "--version"
 
@@ -66,7 +67,7 @@ Usage:
   pqmigrate down [--url=<url>] [--dir=<dir>] [--steps=<steps>] [--bw] [-d] [--name=<name>]
   pqmigrate sync [--url=<url>] [--dir=<dir>] [--bw] [-d]
   pqmigrate replace [--url=<url>] [--dir=<dir>] [--bw] [-d] --name=<name>
-  pqmigrate create <name> [--dir=<dir>] [--bw] [-d]
+  pqmigrate create <name> [--dir=<dir>] [--bw] [-d] [--no-tx]
   pqmigrate dump-schema [--dir=<dir>] [--name=<name>] [--bw]
   pqmigrate dump-full [--dir=<dir>] [--name=<name>] [--bw]
   pqmigrate load-schema [--dir=<dir>] [--name=<name>] [--bw] [-d]
@@ -87,6 +88,7 @@ Options:
   --steps=<steps>  Max steps to migrate [default: 1].
   --bw             No colour (black and white). [default false]
   -d               Dry run, test migrations but rollback changes. [default: false]
+  --no-tx          Create a migration that runs outside a transaction. [default: false]
 `
 	configOptions := `
 Configuration
@@ -243,6 +245,7 @@ func getConfig() (pqmigrate.Config, error) {
 	}
 	cfg.Debug = getEnvOrDefaultBool("PQM_DEBUG", false)
 	cfg.AllInOneTx = getEnvOrDefaultBool("PQM_ALL_IN_ONE_TX", false)
+	cfg.AllowNoTransaction = true
 	cfg.Logger = logger
 	cfg.MigrationsTable = os.Getenv("PQM_MIGRATIONS_TABLE")
 	cfg.DryRun = false
@@ -289,6 +292,9 @@ func createCMD() error {
 	if name == nil {
 		return fmt.Errorf("<name> required")
 	}
+	if noTx, ok := arguments[argNoTx].(bool); ok && noTx {
+		return ctx.CreateMigrationNoTx(*name)
+	}
 	return ctx.CreateMigration(*name)
 }
 
@@ -302,7 +308,7 @@ func upCMD() error {
 		}
 		return ctx.Finish()
 	}
-	if err := ctx.MigrateUp(steps); err != nil {
+	if _, err := ctx.MigrateUp(steps); err != nil {
 		return err
 	}
 	return ctx.Finish()
@@ -318,7 +324,7 @@ func downCMD() error {
 		}
 		return ctx.Finish()
 	}
-	if err := ctx.MigrateDown(steps); err != nil {
+	if _, err := ctx.MigrateDown(steps); err != nil {
 		return err
 	}
 	return ctx.Finish()

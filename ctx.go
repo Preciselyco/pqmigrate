@@ -1,6 +1,7 @@
 package pqmigrate
 
 import (
+	"database/sql"
 	"strings"
 
 	"github.com/Preciselyco/pqdbr"
@@ -11,6 +12,8 @@ import (
 type PQMigrate struct {
 	dbConn   *pqdbr.Connection
 	tx       *pqdbr.Tx
+	auxConn  *pqdbr.Connection
+	lockConn *sql.Conn
 	dbTokens map[string]string
 	config   Config
 	logger   Logger
@@ -44,9 +47,15 @@ func ctxNew(config Config) *PQMigrate {
 
 func (ctx *PQMigrate) finish() error {
 	ctx.dbg("finish")
-	if err := ctx.dbFinish(); err != nil {
+	err := ctx.dbFinish()
+	if err != nil {
 		ctx.dbg("finish", err)
-		return err
 	}
-	return nil
+	if auxErr := ctx.dbReleaseAux(); auxErr != nil {
+		ctx.dbg("finish", auxErr)
+		if err == nil {
+			err = auxErr
+		}
+	}
+	return err
 }

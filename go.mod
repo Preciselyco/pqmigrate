@@ -12,6 +12,7 @@ require (
 	github.com/lib/pq v1.5.2
 	github.com/mattn/go-colorable v0.1.6 // indirect
 	github.com/sergi/go-diff v1.1.0 // indirect
+	github.com/stretchr/testify v1.9.0
 	golang.org/x/sys v0.0.0-20200523222454-059865788121 // indirect
 	golang.org/x/text v0.3.2
 )
