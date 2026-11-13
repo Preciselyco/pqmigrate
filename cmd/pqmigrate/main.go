@@ -53,6 +53,7 @@ var cmds = map[string]struct {
 	"load-schema": {f: loadSchemaCMD, d: "loading database schema"},
 	"load-dump":   {f: loadDumpCMD, d: "loading database dump"},
 	"seed":        {f: seedCMD, d: "seeding database"},
+	"mark-all":    {f: markAllCMD, d: "marking all migrations as applied"},
 	"squash":      {f: squashCMD, d: "squashing migrations"},
 	"unsquash":    {f: unSquashCMD, d: "unsquashing migrations"},
 }
@@ -73,6 +74,7 @@ Usage:
   pqmigrate load-schema [--dir=<dir>] [--name=<name>] [--bw] [-d]
   pqmigrate load-dump <name> [--dir=<dir>] [--name=<name>] [--bw] [-d]
   pqmigrate seed [--dir=<dir>] [--name=<name>] [--bw] [-d]
+  pqmigrate mark-all [--url=<url>] [--dir=<dir>] [--bw] [-d]
   pqmigrate squash [--dir=<dir>] [--bw]
   pqmigrate unsquash [--dir=<dir>] [--bw]
   pqmigrate -h | --help
@@ -395,6 +397,15 @@ func seedCMD() error {
 		fileName = *fn
 	}
 	if err := ctx.MigrateFromFile(fileName); err != nil {
+		return err
+	}
+	return ctx.Finish()
+}
+
+func markAllCMD() error {
+	ctx := pqmigrate.New(getConfigOrDie())
+	if _, err := ctx.MarkAllMigrated(); err != nil {
+		_ = ctx.Finish()
 		return err
 	}
 	return ctx.Finish()

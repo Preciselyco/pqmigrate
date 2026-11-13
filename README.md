@@ -111,6 +111,25 @@ leave `LockKey` at 0 there. The wait has no timeout; a waiter logs every 30
 seconds, and a stuck holder (find it in `pg_locks` where `locktype =
 'advisory'`) has to be terminated by hand.
 
+## Latest schema
+
+A project can keep its schema file at the **latest** state, the schema after
+every migration has run, and use migrations only to upgrade databases that
+already exist. A new database then never runs a migration:
+
+1. `LoadDBSchema` loads the schema (and `MigrateFromFile` the seeds).
+2. `MarkAllMigrated` records every migration in the directory as applied,
+   without running it.
+
+With `AllInOneTx` the three commit together in `Finish`. `MarkAllMigrated`
+refuses a database whose migrations table already has rows, because marking a
+database that wasn't built from the latest schema would hide migrations that
+never ran. A migration can then be deleted once every database has run it.
+
+The CLI equivalent is `pqmigrate mark-all` after `load-schema` and `seed`. Each
+of those is its own process and commits on its own (`load-schema` always runs
+with `AllInOneTx` off), so only the library path with `AllInOneTx` is atomic.
+
 
 ## License
 [![FOSSA Status](https://app.fossa.io/api/projects/git%2Bgithub.com%2FPreciselyco%2Fpqmigrate.svg?type=large)](https://app.fossa.io/projects/git%2Bgithub.com%2FPreciselyco%2Fpqmigrate?ref=badge_large)
