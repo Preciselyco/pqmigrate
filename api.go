@@ -142,6 +142,52 @@ func (ctx *PQMigrate) migrateSteps(migs []*migration, steps int, md migrateDirec
 	return done, nil
 }
 
+// MarkAllMigrated records every migration in the migrations directory as
+// applied, without running it, and returns how many it recorded. It is for a
+// database just built from a schema that already contains every migration
+// (see README, "Latest schema"), so it refuses, before recording anything, a
+// database whose migrations table already has rows.
+//
+// The rows are written in the same transaction as the calls before it, so
+// with AllInOneTx a schema load, seeds and MarkAllMigrated commit together in
+// Finish. It takes Config.LockKey like MigrateUp.
+func (ctx *PQMigrate) MarkAllMigrated() (int, error) {
+	ctx.dbg("MarkAllMigrated")
+	if err := ctx.dbLock(); err != nil {
+		return 0, err
+	}
+	defer ctx.dbUnlockIfDone()
+	migrations, err := ctx.migrationGetAll()
+	if err != nil {
+		return 0, err
+	}
+	if err := ctx.dbMigrationsTableExist(); err != nil {
+		return 0, err
+	}
+	migrated, err := ctx.dbGetMigrated()
+	if err != nil {
+		return 0, err
+	}
+	if len(migrated) > 0 {
+		return 0, fmt.Errorf("%s already records %d migration(s); MarkAllMigrated only marks a database built from the latest schema", ctx.config.MigrationsTable, len(migrated))
+	}
+	sort.Sort(byVersion(migrations))
+	if err := ctx.dbInsertMigrationBatch(migrations); err != nil {
+		return 0, err
+	}
+	if !ctx.config.AllInOneTx {
+		if err := ctx.dbFinish(); err != nil {
+			return 0, err
+		}
+	}
+	if ctx.config.DryRun {
+		ctx.logger.Inf(fmt.Sprintf("would mark %d migration(s) as applied (dry run)", len(migrations)))
+	} else {
+		ctx.logger.Inf(fmt.Sprintf("marked %d migration(s) as applied", len(migrations)))
+	}
+	return len(migrations), nil
+}
+
 // MigrateUpFile applies specified `up` migration and inserts
 // both `up` and `down` into the migrations table.
 func (ctx *PQMigrate) MigrateUpFile(fileName string) error {
